@@ -10,16 +10,11 @@ import os
 # Load the data
 data = pd.read_csv('Case2.csv', index_col=0)
 
-'''
-We recommend that you change your train and test split
-'''
+# Split data into training and test sets
 TRAIN, TEST = train_test_split(data, test_size=0.2, shuffle=False)
 
 class Allocator():
     def __init__(self, train_data):
-        '''
-        Anything data you want to store between days must be stored in a class field
-        '''
         self.running_price_paths = train_data.copy()
         self.train_data = train_data.copy()
         self.n_assets = train_data.shape[1]
@@ -28,6 +23,7 @@ class Allocator():
         self.last_weights = np.ones(self.n_assets) / self.n_assets
         self.tick_count = 0
         self.intraday_prices = []
+        self.risk_free_rate = 0.0  # Set to 0.03 or other if desired
 
     def _calculate_realized_vol(self, data):
         vol_list = []
@@ -44,7 +40,6 @@ class Allocator():
         if self.tick_count < 30:
             return self.last_weights
 
-        # End of day logic
         prices_matrix = np.vstack(self.intraday_prices)
         log_ret_matrix = np.diff(np.log(prices_matrix), axis=0)
         realized_vol_today = np.sqrt(np.sum(log_ret_matrix ** 2, axis=0))
@@ -62,15 +57,14 @@ class Allocator():
             self.intraday_prices = []
             return self.last_weights
 
-        mu = 0.6 * returns.ewm(span=20).mean().iloc[-1].values + 0.4 * returns.mean().values
+        mu = returns.mean().values
         lw = LedoitWolf()
         Sigma = lw.fit(returns).covariance_
-        Sigma += np.diag((self.daily_vols ** 2).mean().values)
 
         def objective(w):
             port_return = np.dot(w, mu)
             port_vol = np.sqrt(np.dot(w, Sigma @ w))
-            return -port_return / port_vol if port_vol > 1e-8 else 0
+            return -(port_return - self.risk_free_rate) / port_vol if port_vol > 1e-8 else 0
 
         constraints = [
             {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
@@ -96,11 +90,7 @@ class Allocator():
         self.intraday_prices = []
         return self.last_weights
 
-
 def grading(train_data, test_data):
-    '''
-    Grading Script
-    '''
     weights = np.full(shape=(len(test_data.index), 6), fill_value=0.0)
     alloc = Allocator(train_data)
     for i in range(0, len(test_data)):
@@ -118,24 +108,23 @@ def grading(train_data, test_data):
     capital = np.array(capital)
     returns = (capital[1:] - capital[:-1]) / capital[:-1]
 
-    if np.std(returns) != 0:
-        sharpe = np.mean(returns) / np.std(returns)
-    else:
-        sharpe = 0
-
+    sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
     return sharpe, capital, weights
-
 
 # Run grading
 sharpe, capital, weights = grading(TRAIN, TEST)
-print(f\"Sharpe Ratio: {sharpe:.4f}\")
+print(f"Sharpe Ratio: {sharpe:.4f}")
 
 # Plotting
 plt.figure(figsize=(10, 6), dpi=80)
-plt.title(\"Capital Over Time\")
+plt.title("Capital Over Time")
 plt.plot(np.arange(len(TEST)), capital)
-plt.xlabel(\"Time\")
-plt.ylabel(\"Capital\")
+plt.xlabel("Time")
+plt.ylabel("Capital")
 plt.grid(True)
 plt.show()
 
+
+# credits:
+# https://github.com/sabvan/UChicagoTradingComp/blob/main/case2
+# https://github.com/PaiViji/PythonFinance-PortfolioOptimization/blob/master/Lesson6_SharpeRatioOptimization/Lesson6_MainContent.ipynb
