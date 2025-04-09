@@ -10,26 +10,31 @@ TRAIN, TEST = train_test_split(data, test_size=0.2, shuffle=False)
 
 # Global best alpha (will be set after tuning)
 BEST_ALPHA = None
+BEST_LAMBDA = None
 
 class Allocator():
-    def __init__(self, train_data, alpha=None):
-        global BEST_ALPHA
+
+
+    class Allocator():
+    def __init__(self, train_data, alpha=None, lambda_=None):
+        global BEST_ALPHA, BEST_LAMBDA
         self.train_data = train_data.copy()
         self.n_assets = train_data.shape[1]
         self.last_weights = np.ones(self.n_assets) / self.n_assets
         self.tick_count = 0
         self.intraday_prices = []
         self.ema_returns = None
-        self.ema_var = None
-        # Use passed alpha, or fall back to tuned best alpha
+        self.ema_cov = None
         self.alpha = alpha if alpha is not None else BEST_ALPHA
+        self.lambda_ = lambda_ if lambda_ is not None else BEST_LAMBDA
         self.risk_free_rate = 0.0
 
     def _detect_outliers_and_replace(self, prices):
         if len(self.intraday_prices) < 10:
             return prices
-        rolling_mean = pd.DataFrame(self.intraday_prices).rolling(window=10, min_periods=1).mean().iloc[-1].values
-        rolling_std = pd.DataFrame(self.intraday_prices).rolling(window=10, min_periods=1).std().iloc[-1].values + 1e-8
+        rolling = pd.DataFrame(self.intraday_prices).rolling(window=10, min_periods=1)
+        rolling_mean = rolling.mean().iloc[-1].values
+        rolling_std = rolling.std().iloc[-1].values + 1e-8
         z_scores = (prices - rolling_mean) / rolling_std
         prices[np.abs(z_scores) > 3] = rolling_mean[np.abs(z_scores) > 3]
         return prices
@@ -45,36 +50,41 @@ class Allocator():
         prices_matrix = np.vstack(self.intraday_prices)
         log_ret_matrix = np.diff(np.log(prices_matrix), axis=0)
         realized_returns = np.mean(log_ret_matrix, axis=0)
-        realized_var = np.var(log_ret_matrix, axis=0)
 
         if self.ema_returns is None:
             self.ema_returns = realized_returns
-            self.ema_var = realized_var
+            self.ema_cov = np.cov(log_ret_matrix.T)
         else:
             self.ema_returns = self.alpha * self.ema_returns + (1 - self.alpha) * realized_returns
-            self.ema_var = self.alpha * self.ema_var + (1 - self.alpha) * realized_var
+            centered = log_ret_matrix - realized_returns
+            sample_cov = centered.T @ centered / (log_ret_matrix.shape[0] - 1)
+            self.ema_cov = self.alpha * self.ema_cov + (1 - self.alpha) * sample_cov
 
         mu = self.ema_returns
-        Sigma = np.diag(self.ema_var)
+        Sigma = self.ema_cov
 
-        def objective(w):
-            port_return = np.dot(w, mu)
-            port_vol = np.sqrt(np.dot(w, Sigma @ w))
-            return -(port_return - self.risk_free_rate) / port_vol if port_vol > 1e-8 else 0
+        def markowitz_objective(w, lambda_):
+            port_var = w.T @ Sigma @ w
+            port_return = w.T @ mu
+            return port_var - lambda_ * (port_return - self.risk_free_rate)
 
-        constraints = [
-            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
-            {'type': 'eq', 'fun': lambda w: np.sqrt(w @ Sigma @ w.T) - np.sqrt(np.mean(self.ema_var))}
-        ]
+        best_portfolio = self.last_weights
+        best_objective = np.inf
 
-        result = minimize(objective,
-                          x0=self.last_weights,
-                          bounds=[(-1, 1)] * self.n_assets,
-                          constraints=constraints,
-                          method='SLSQP',
-                          options={'maxiter': 300})
+        for lam in range(1, 21):
+            result = minimize(
+                fun=lambda w: markowitz_objective(w, lam),
+                x0=self.last_weights,
+                bounds=[(-1, 1)] * self.n_assets,
+                constraints=[{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}],
+                method='SLSQP',
+                options={'maxiter': 300}
+            )
+            if result.success and markowitz_objective(result.x, lam) < best_objective:
+                best_objective = markowitz_objective(result.x, lam)
+                best_portfolio = result.x
 
-        new_weights = result.x if result.success else self.last_weights
+        new_weights = best_portfolio
         delta = new_weights - self.last_weights
         max_turnover = 0.05
         delta_norm = np.linalg.norm(delta, 1)
@@ -86,7 +96,50 @@ class Allocator():
         self.intraday_prices = []
         return self.last_weights
 
-# Internal grading function for alpha tuning
+# Sharpe-tuned lambda evaluator
+def evaluate_lambda(train_data, test_data, alpha, lambda_):
+    weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
+    alloc = Allocator(train_data, alpha=alpha, lambda_=lambda_)
+    for i in range(len(test_data)):
+        weights[i, :] = alloc.allocate_portfolio(test_data.iloc[i, :])
+
+    capital = [1]
+    for i in range(len(test_data) - 1):
+        shares = capital[-1] * weights[i] / np.array(test_data.iloc[i, :])
+        balance = capital[-1] - np.dot(shares, np.array(test_data.iloc[i, :]))
+        net_change = np.dot(shares, np.array(test_data.iloc[i + 1, :]))
+        capital.append(balance + net_change)
+
+    capital = np.array(capital)
+    returns = (capital[1:] - capital[:-1]) / capital[:-1]
+    sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
+    return sharpe
+
+# Tune lambda using best alpha
+lambda_range = range(1, 21)
+lambda_sharpes = []
+for lam in lambda_range:
+    sharpe = evaluate_lambda(TRAIN, TEST, alpha=BEST_ALPHA, lambda_=lam)
+    lambda_sharpes.append(sharpe)
+
+BEST_LAMBDA = lambda_range[np.argmax(lambda_sharpes)]
+print(f"Best Lambda: {BEST_LAMBDA} with Sharpe Ratio: {max(lambda_sharpes):.4f}")
+
+# Plot Sharpe vs Lambda
+plt.figure(figsize=(10, 6))
+plt.plot(lambda_range, lambda_sharpes, marker='o')
+plt.title("Sharpe Ratio vs. Lambda (Markowitz)")
+plt.xlabel("Lambda")
+plt.ylabel("Sharpe Ratio")
+plt.axvline(x=BEST_LAMBDA, color='red', linestyle='--', label=f'Best λ = {BEST_LAMBDA}')
+plt.grid(True)
+plt.legend()
+plt.show()
+
+ 
+        
+
+
 def evaluate_alpha(train_data, test_data, alpha):
     weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
     alloc = Allocator(train_data, alpha=alpha)
