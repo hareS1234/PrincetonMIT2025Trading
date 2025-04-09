@@ -13,9 +13,6 @@ BEST_ALPHA = None
 BEST_LAMBDA = None
 
 class Allocator():
-
-
-    class Allocator():
     def __init__(self, train_data, alpha=None, lambda_=None):
         global BEST_ALPHA, BEST_LAMBDA
         self.train_data = train_data.copy()
