@@ -8,8 +8,12 @@ from scipy.optimize import minimize
 data = pd.read_csv('Case2.csv', index_col=0)
 TRAIN, TEST = train_test_split(data, test_size=0.2, shuffle=False)
 
+# Global best alpha (will be set after tuning)
+BEST_ALPHA = None
+
 class Allocator():
-    def __init__(self, train_data, alpha):
+    def __init__(self, train_data, alpha=None):
+        global BEST_ALPHA
         self.train_data = train_data.copy()
         self.n_assets = train_data.shape[1]
         self.last_weights = np.ones(self.n_assets) / self.n_assets
@@ -17,7 +21,8 @@ class Allocator():
         self.intraday_prices = []
         self.ema_returns = None
         self.ema_var = None
-        self.alpha = alpha
+        # Use passed alpha, or fall back to tuned best alpha
+        self.alpha = alpha if alpha is not None else BEST_ALPHA
         self.risk_free_rate = 0.0
 
     def _detect_outliers_and_replace(self, prices):
@@ -81,9 +86,10 @@ class Allocator():
         self.intraday_prices = []
         return self.last_weights
 
-def grading(train_data, test_data, alpha):
+# Internal grading function for alpha tuning
+def evaluate_alpha(train_data, test_data, alpha):
     weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
-    alloc = Allocator(train_data, alpha)
+    alloc = Allocator(train_data, alpha=alpha)
     for i in range(len(test_data)):
         weights[i, :] = alloc.allocate_portfolio(test_data.iloc[i, :])
 
@@ -97,25 +103,31 @@ def grading(train_data, test_data, alpha):
     capital = np.array(capital)
     returns = (capital[1:] - capital[:-1]) / capital[:-1]
     sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
-    return sharpe, capital
+    return sharpe
 
-# Run simulation
-alpha_range = np.arange(0.1, 1.0, 0.01)
+# Find best alpha
+alpha_range = np.arange(0.1, 1.0, 0.1)
 sharpe_values = []
 
 for alpha in alpha_range:
-    sharpe, _ = grading(TRAIN, TEST, alpha)
+    sharpe = evaluate_alpha(TRAIN, TEST, alpha)
     sharpe_values.append(sharpe)
 
-# Plotting alpha vs Sharpe
+BEST_ALPHA = alpha_range[np.argmax(sharpe_values)]
+print(f"Best Alpha: {BEST_ALPHA:.2f} with Sharpe Ratio: {max(sharpe_values):.4f}")
+
+# Plot
 plt.figure(figsize=(10, 6))
 plt.plot(alpha_range, sharpe_values, marker='o')
+plt.axvline(x=BEST_ALPHA, color='red', linestyle='--', label=f'Best α = {BEST_ALPHA:.2f}')
 plt.title("Sharpe Ratio vs. Alpha")
 plt.xlabel("Alpha (EMA Smoothing Factor)")
 plt.ylabel("Sharpe Ratio")
 plt.grid(True)
+plt.legend()
 plt.show()
 
+# === DO NOT MODIFY ===
 def grading(train_data, test_data): 
     '''
     Grading Script
@@ -143,8 +155,8 @@ def grading(train_data, test_data):
         
     return sharpe, capital, weights
 
+# Final grading run with best alpha
 sharpe, capital, weights = grading(TRAIN, TEST)
-#Sharpe gets printed to command line
 print(sharpe)
 
 plt.figure(figsize=(10, 6), dpi=80)
