@@ -136,3 +136,48 @@ for i in range(len(TEST)):
 returns = np.diff(capital)/capital[:-1]
 sharpe = np.sqrt(252) * np.mean(returns)/np.std(returns)
 print(f"Annualized Sharpe Ratio: {sharpe:.2f}")
+
+
+#########
+def grading(train_data, test_data): 
+    '''
+    Grading Script
+    '''
+    weights = np.full(shape=(len(test_data.index),5), fill_value=0.0)
+    alloc = Allocator(train_data)
+    for i in range(0,len(test_data)):
+        weights[i,:] = alloc.allocate_portfolio(test_data.iloc[i,:])
+        if np.sum(weights < -1) or np.sum(weights > 1):
+            raise Exception("Weights Outside of Bounds")
+    
+    capital = [1]
+    for i in range(len(test_data) - 1):
+        shares = capital[-1] * weights[i] / np.array(test_data.iloc[i,:])
+        balance = capital[-1] - np.dot(shares, np.array(test_data.iloc[i,:]))
+        net_change = np.dot(shares, np.array(test_data.iloc[i+1,:]))
+        capital.append(balance + net_change)
+    capital = np.array(capital)
+    returns = (capital[1:] - capital[:-1]) / capital[:-1]
+    
+    if np.std(returns) != 0:
+        sharpe = np.mean(returns) / np.std(returns)
+    else:
+        sharpe = 0
+        
+    return sharpe, capital, weights
+
+sharpe, capital, weights = grading(TRAIN, TEST)
+#Sharpe gets printed to command line
+print(sharpe)
+
+plt.figure(figsize=(10, 6), dpi=80)
+plt.title("Capital")
+plt.plot(np.arange(len(TEST)), capital)
+plt.show()
+
+plt.figure(figsize=(10, 6), dpi=80)
+plt.title("Weights")
+plt.plot(np.arange(len(TEST)), weights)
+plt.legend(TEST.columns)
+plt.show()
+
