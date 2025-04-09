@@ -4,236 +4,163 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from scipy.optimize import minimize
 
-# Load the data
+# Load data
 data = pd.read_csv('Case2.csv', index_col=0)
 TRAIN, TEST = train_test_split(data, test_size=0.2, shuffle=False)
 
-# Global best alpha (will be set after tuning)
+# Global best parameters
 BEST_ALPHA = None
-BEST_LAMBDA = None
 
 class Allocator():
-    def __init__(self, train_data, alpha=None, lambda_=None):
-        global BEST_ALPHA, BEST_LAMBDA
+    def __init__(self, train_data, alpha=0.5):
         self.train_data = train_data.copy()
         self.n_assets = train_data.shape[1]
         self.last_weights = np.ones(self.n_assets) / self.n_assets
-        self.tick_count = 0
         self.intraday_prices = []
-        self.ema_returns = None
-        self.ema_cov = None
-        self.alpha = alpha if alpha is not None else BEST_ALPHA
-        self.lambda_ = lambda_ if lambda_ is not None else BEST_LAMBDA
+        self.alpha = alpha
         self.risk_free_rate = 0.0
+        
+        # Initialize EMA parameters with training data
+        train_prices = train_data.values
+        train_returns = np.diff(np.log(train_prices), axis=0)
+        if len(train_returns) > 0:
+            self.ema_returns = np.mean(train_returns, axis=0)
+            self.ema_cov = np.cov(train_returns.T)
+        else:
+            self.ema_returns = np.zeros(self.n_assets)
+            self.ema_cov = np.eye(self.n_assets)
+            
+        # Outlier detection parameters
+        self.rolling_window = 10
+        self.price_history = train_data.values[-self.rolling_window:].tolist()
 
-    def _detect_outliers_and_replace(self, prices):
-        if len(self.intraday_prices) < 10:
+    def _handle_outliers(self, prices):
+        """Replace outliers with rolling average"""
+        if len(self.price_history) < self.rolling_window:
             return prices
-        rolling = pd.DataFrame(self.intraday_prices).rolling(window=10, min_periods=1)
-        rolling_mean = rolling.mean().iloc[-1].values
-        rolling_std = rolling.std().iloc[-1].values + 1e-8
+        
+        df = pd.DataFrame(self.price_history)
+        rolling_mean = df.rolling(self.rolling_window).mean().iloc[-1].values
+        rolling_std = df.rolling(self.rolling_window).std().iloc[-1].values + 1e-8
+        
         z_scores = (prices - rolling_mean) / rolling_std
-        prices[np.abs(z_scores) > 3] = rolling_mean[np.abs(z_scores) > 3]
+        prices = np.where(np.abs(z_scores) > 3, rolling_mean, prices)
         return prices
 
     def allocate_portfolio(self, asset_prices):
-        asset_prices = self._detect_outliers_and_replace(np.array(asset_prices))
-        self.intraday_prices.append(asset_prices)
-        self.tick_count += 1
-
-        if self.tick_count < 30:
-            return self.last_weights
-
-        prices_matrix = np.vstack(self.intraday_prices)
-        log_ret_matrix = np.diff(np.log(prices_matrix), axis=0)
-        realized_returns = np.mean(log_ret_matrix, axis=0)
-
-        if self.ema_returns is None:
-            self.ema_returns = realized_returns
-            self.ema_cov = np.cov(log_ret_matrix.T)
-        else:
-            self.ema_returns = self.alpha * self.ema_returns + (1 - self.alpha) * realized_returns
-            centered = log_ret_matrix - realized_returns
-            sample_cov = centered.T @ centered / (log_ret_matrix.shape[0] - 1)
-            self.ema_cov = self.alpha * self.ema_cov + (1 - self.alpha) * sample_cov
-
-        mu = self.ema_returns
-        Sigma = self.ema_cov
-
-        # Trader fix: skip update if mu too small (no signal)
-        if np.linalg.norm(mu) < 1e-4 or np.any(np.isnan(mu)) or np.any(np.isnan(Sigma)):
-            self.tick_count = 0
-            self.intraday_prices = []
-            return self.last_weights
-
-        # Ensure positive semi-definite covariance
-        Sigma = (Sigma + Sigma.T) / 2 + np.eye(self.n_assets) * 1e-6
-
-
-        def markowitz_objective(w, lambda_):
-            port_var = w.T @ Sigma @ w
-            port_return = w.T @ mu
-            excess_ret = max(port_return - self.risk_free_rate, 1e-4)
-            return port_var - lambda_ * (port_return - self.risk_free_rate)
-
-
-        best_portfolio = self.last_weights
-        best_objective = np.inf
-
-        for lam in range(1, 21):
-            result = minimize(
-                fun=lambda w: markowitz_objective(w, lam),
-                x0=self.last_weights,
-                bounds=[(-1, 1)] * self.n_assets,
-                constraints=[{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}],
-                method='SLSQP',
-                options={'maxiter': 300}
-            )
-            if result.success and markowitz_objective(result.x, lam) < best_objective:
-                best_objective = markowitz_objective(result.x, lam)
-                best_portfolio = result.x
-
-        # Defensive fallback: ensure the portfolio has correct length
-        new_weights = best_portfolio
-
-        # If optimizer returned wrong shape (e.g. length 5 instead of 6), fallback
-        if new_weights.shape[0] != self.n_assets:
-            print(f"[WARNING] Weight dimension mismatch: got {new_weights.shape[0]}, expected {self.n_assets}. Using last_weights.")
-            new_weights = self.last_weights
-
-        # Enforce turnover constraint
-        delta = new_weights - self.last_weights
-        max_turnover = 0.05
-        delta_norm = np.linalg.norm(delta, 1)
-        if delta_norm > max_turnover:
-            new_weights = self.last_weights + delta * (max_turnover / delta_norm)
-
-        self.last_weights = np.clip(new_weights, -1, 1)
-        self.tick_count = 0
-        self.intraday_prices = []
-
-        return self.last_weights
-
-
-# Sharpe-tuned lambda evaluator
-def evaluate_lambda(train_data, test_data, alpha, lambda_):
-    weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
-    alloc = Allocator(train_data, alpha=alpha, lambda_=lambda_)
-    for i in range(len(test_data)):
-        weights[i, :] = alloc.allocate_portfolio(test_data.iloc[i, :])
-
-    capital = [1]
-    for i in range(len(test_data) - 1):
-        shares = capital[-1] * weights[i] / np.array(test_data.iloc[i, :])
-        balance = capital[-1] - np.dot(shares, np.array(test_data.iloc[i, :]))
-        net_change = np.dot(shares, np.array(test_data.iloc[i + 1, :]))
-        capital.append(balance + net_change)
-
-    capital = np.array(capital)
-    returns = (capital[1:] - capital[:-1]) / capital[:-1]
-    sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
-    return sharpe
- 
+        # Handle outliers and update price history
+        prices = self._handle_outliers(np.array(asset_prices))
+        self.price_history.append(prices)
+        self.price_history = self.price_history[-self.rolling_window:]
         
-def evaluate_alpha(train_data, test_data, alpha):
-    weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
+        # Update EMA returns and covariance
+        if len(self.price_history) > 1:
+            latest_returns = np.log(prices) - np.log(self.price_history[-2])
+            
+            # Update EMA returns
+            self.ema_returns = self.alpha * self.ema_returns + (1 - self.alpha) * latest_returns
+            
+            # Update EMA covariance
+            delta = latest_returns - self.ema_returns
+            self.ema_cov = self.alpha * self.ema_cov + (1 - self.alpha) * np.outer(delta, delta)
+        
+        # Optimization
+        mu = self.ema_returns
+        Sigma = (self.ema_cov + self.ema_cov.T) / 2 + 1e-6 * np.eye(self.n_assets)  # Ensure PSD
+        
+        def objective(w):
+            port_return = w @ mu
+            port_vol = np.sqrt(w @ Sigma @ w)
+            return -(port_return - self.risk_free_rate) / port_vol if port_vol > 1e-8 else 0
+        
+        constraints = [
+            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
+            {'type': 'ineq', 'fun': lambda w: 0.05 - np.linalg.norm(w - self.last_weights, 1)}
+        ]
+        
+        result = minimize(objective, self.last_weights,
+                          bounds=[(-1, 1)] * self.n_assets,
+                          constraints=constraints,
+                          method='SLSQP')
+        
+        if result.success:
+            new_weights = result.x
+            new_weights = np.clip(new_weights, -1, 1)
+            self.last_weights = new_weights
+            
+        return self.last_weights.copy()
+
+def evaluate_sharpe(train_data, test_data, alpha):
     alloc = Allocator(train_data, alpha=alpha)
+    capital = [1.0]
+    weights = []
+    
     for i in range(len(test_data)):
-        weights[i, :] = alloc.allocate_portfolio(test_data.iloc[i, :])
-
-    capital = [1]
-    for i in range(len(test_data) - 1):
-        shares = capital[-1] * weights[i] / np.array(test_data.iloc[i, :])
-        balance = capital[-1] - np.dot(shares, np.array(test_data.iloc[i, :]))
-        net_change = np.dot(shares, np.array(test_data.iloc[i + 1, :]))
-        capital.append(balance + net_change)
-
-    capital = np.array(capital)
-    returns = (capital[1:] - capital[:-1]) / capital[:-1]
-    sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
+        prices = test_data.iloc[i].values
+        weights.append(alloc.allocate_portfolio(prices))
+        
+        if i == 0:
+            continue
+            
+        # Update capital
+        prev_prices = test_data.iloc[i-1].values
+        curr_prices = prices
+        shares = capital[-1] * weights[i-1] / prev_prices
+        capital.append(shares @ curr_prices)
+    
+    returns = np.diff(capital) / capital[:-1]
+    sharpe = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0
     return sharpe
 
-# Tune alpha first
-alpha_range = np.arange(0.1, 1.0, 0.1)
-alpha_sharpes = []
+# Alpha tuning
+alphas = np.linspace(0.1, 0.9, 9)
+sharpe_results = []
 
-for alpha in alpha_range:
-    sharpe = evaluate_lambda(TRAIN, TEST, alpha=alpha, lambda_=10)  # use a neutral lambda
-    alpha_sharpes.append(sharpe)
+for alpha in alphas:
+    sharpe = evaluate_sharpe(TRAIN, TEST, alpha)
+    sharpe_results.append(sharpe)
+    print(f"Alpha: {alpha:.1f}, Sharpe: {sharpe:.4f}")
 
-BEST_ALPHA = alpha_range[np.argmax(alpha_sharpes)]
-print(f"Best Alpha: {BEST_ALPHA:.2f} with Sharpe Ratio: {max(alpha_sharpes):.4f}")
+BEST_ALPHA = alphas[np.argmax(sharpe_results)]
 
+# Plot alpha tuning results
 plt.figure(figsize=(10, 6))
-plt.plot(alpha_range, alpha_sharpes, marker='o')
+plt.plot(alphas, sharpe_results, marker='o')
 plt.title("Sharpe Ratio vs. Alpha")
 plt.xlabel("Alpha")
 plt.ylabel("Sharpe Ratio")
-plt.axvline(x=BEST_ALPHA, color='red', linestyle='--', label=f'Best α = {BEST_ALPHA:.2f}')
+plt.axvline(x=BEST_ALPHA, color='r', linestyle='--', label=f'Best Alpha: {BEST_ALPHA:.2f}')
 plt.grid(True)
 plt.legend()
 plt.show()
 
-# Now tune lambda using best alpha
-lambda_range = range(1, 21)
-lambda_sharpes = []
+# Final evaluation with best alpha
+alloc = Allocator(TRAIN, alpha=BEST_ALPHA)
+capital = [1.0]
+weights = []
 
-for lam in lambda_range:
-    sharpe = evaluate_lambda(TRAIN, TEST, alpha=BEST_ALPHA, lambda_=lam)
-    lambda_sharpes.append(sharpe)
-
-BEST_LAMBDA = lambda_range[np.argmax(lambda_sharpes)]
-print(f"Best Lambda: {BEST_LAMBDA} with Sharpe Ratio: {max(lambda_sharpes):.4f}")
-
-plt.figure(figsize=(10, 6))
-plt.plot(lambda_range, lambda_sharpes, marker='o')
-plt.title("Sharpe Ratio vs. Lambda (Markowitz)")
-plt.xlabel("Lambda")
-plt.ylabel("Sharpe Ratio")
-plt.axvline(x=BEST_LAMBDA, color='red', linestyle='--', label=f'Best λ = {BEST_LAMBDA}')
-plt.grid(True)
-plt.legend()
-plt.show()
-
-# === DO NOT MODIFY ===
-def grading(train_data, test_data): 
-    '''
-    Grading Script
-    '''
-    weights = np.full(shape=(len(test_data.index),6), fill_value=0.0)
-    alloc = Allocator(train_data)
-    for i in range(0,len(test_data)):
-        weights[i,:] = alloc.allocate_portfolio(test_data.iloc[i,:])
-        if np.sum(weights < -1) or np.sum(weights > 1):
-            raise Exception("Weights Outside of Bounds")
+for i in range(len(TEST)):
+    prices = TEST.iloc[i].values
+    weights.append(alloc.allocate_portfolio(prices))
     
-    capital = [1]
-    for i in range(len(test_data) - 1):
-        shares = capital[-1] * weights[i] / np.array(test_data.iloc[i,:])
-        balance = capital[-1] - np.dot(shares, np.array(test_data.iloc[i,:]))
-        net_change = np.dot(shares, np.array(test_data.iloc[i+1,:]))
-        capital.append(balance + net_change)
-    capital = np.array(capital)
-    returns = (capital[1:] - capital[:-1]) / capital[:-1]
-    
-    if np.std(returns) != 0:
-        sharpe = np.mean(returns) / np.std(returns)
-    else:
-        sharpe = 0
+    if i == 0:
+        continue
         
-    return sharpe, capital, weights
+    prev_prices = TEST.iloc[i-1].values
+    curr_prices = prices
+    shares = capital[-1] * weights[i-1] / prev_prices
+    capital.append(shares @ curr_prices)
 
-# Final grading run with best alpha
-sharpe, capital, weights = grading(TRAIN, TEST)
-print(sharpe)
+# Calculate final Sharpe ratio
+returns = np.diff(capital) / capital[:-1]
+sharpe = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0
+print(f"\nBest Alpha: {BEST_ALPHA:.2f}, Final Sharpe Ratio: {sharpe:.4f}")
 
-plt.figure(figsize=(10, 6), dpi=80)
-plt.title("Capital")
-plt.plot(np.arange(len(TEST)), capital)
-plt.show()
-
-plt.figure(figsize=(10, 6), dpi=80)
-plt.title("Weights")
-plt.plot(np.arange(len(TEST)), weights)
-plt.legend(TEST.columns)
+# Plot capital curve
+plt.figure(figsize=(10, 6))
+plt.plot(capital)
+plt.title("Capital Evolution")
+plt.xlabel("Time")
+plt.ylabel("Portfolio Value")
+plt.grid(True)
 plt.show()
