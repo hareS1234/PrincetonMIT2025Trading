@@ -111,32 +111,8 @@ def evaluate_lambda(train_data, test_data, alpha, lambda_):
     returns = (capital[1:] - capital[:-1]) / capital[:-1]
     sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
     return sharpe
-
-# Tune lambda using best alpha
-lambda_range = range(1, 21)
-lambda_sharpes = []
-for lam in lambda_range:
-    sharpe = evaluate_lambda(TRAIN, TEST, alpha=BEST_ALPHA, lambda_=lam)
-    lambda_sharpes.append(sharpe)
-
-BEST_LAMBDA = lambda_range[np.argmax(lambda_sharpes)]
-print(f"Best Lambda: {BEST_LAMBDA} with Sharpe Ratio: {max(lambda_sharpes):.4f}")
-
-# Plot Sharpe vs Lambda
-plt.figure(figsize=(10, 6))
-plt.plot(lambda_range, lambda_sharpes, marker='o')
-plt.title("Sharpe Ratio vs. Lambda (Markowitz)")
-plt.xlabel("Lambda")
-plt.ylabel("Sharpe Ratio")
-plt.axvline(x=BEST_LAMBDA, color='red', linestyle='--', label=f'Best λ = {BEST_LAMBDA}')
-plt.grid(True)
-plt.legend()
-plt.show()
-
  
         
-
-
 def evaluate_alpha(train_data, test_data, alpha):
     weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
     alloc = Allocator(train_data, alpha=alpha)
@@ -155,24 +131,44 @@ def evaluate_alpha(train_data, test_data, alpha):
     sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
     return sharpe
 
-# Find best alpha
+# Tune alpha first
 alpha_range = np.arange(0.1, 1.0, 0.1)
-sharpe_values = []
+alpha_sharpes = []
 
 for alpha in alpha_range:
-    sharpe = evaluate_alpha(TRAIN, TEST, alpha)
-    sharpe_values.append(sharpe)
+    sharpe = evaluate_lambda(TRAIN, TEST, alpha=alpha, lambda_=10)  # use a neutral lambda
+    alpha_sharpes.append(sharpe)
 
-BEST_ALPHA = alpha_range[np.argmax(sharpe_values)]
-print(f"Best Alpha: {BEST_ALPHA:.2f} with Sharpe Ratio: {max(sharpe_values):.4f}")
+BEST_ALPHA = alpha_range[np.argmax(alpha_sharpes)]
+print(f"Best Alpha: {BEST_ALPHA:.2f} with Sharpe Ratio: {max(alpha_sharpes):.4f}")
 
-# Plot
 plt.figure(figsize=(10, 6))
-plt.plot(alpha_range, sharpe_values, marker='o')
-plt.axvline(x=BEST_ALPHA, color='red', linestyle='--', label=f'Best α = {BEST_ALPHA:.2f}')
+plt.plot(alpha_range, alpha_sharpes, marker='o')
 plt.title("Sharpe Ratio vs. Alpha")
-plt.xlabel("Alpha (EMA Smoothing Factor)")
+plt.xlabel("Alpha")
 plt.ylabel("Sharpe Ratio")
+plt.axvline(x=BEST_ALPHA, color='red', linestyle='--', label=f'Best α = {BEST_ALPHA:.2f}')
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# Now tune lambda using best alpha
+lambda_range = range(1, 21)
+lambda_sharpes = []
+
+for lam in lambda_range:
+    sharpe = evaluate_lambda(TRAIN, TEST, alpha=BEST_ALPHA, lambda_=lam)
+    lambda_sharpes.append(sharpe)
+
+BEST_LAMBDA = lambda_range[np.argmax(lambda_sharpes)]
+print(f"Best Lambda: {BEST_LAMBDA} with Sharpe Ratio: {max(lambda_sharpes):.4f}")
+
+plt.figure(figsize=(10, 6))
+plt.plot(lambda_range, lambda_sharpes, marker='o')
+plt.title("Sharpe Ratio vs. Lambda (Markowitz)")
+plt.xlabel("Lambda")
+plt.ylabel("Sharpe Ratio")
+plt.axvline(x=BEST_LAMBDA, color='red', linestyle='--', label=f'Best λ = {BEST_LAMBDA}')
 plt.grid(True)
 plt.legend()
 plt.show()
