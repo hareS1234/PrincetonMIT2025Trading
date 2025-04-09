@@ -73,7 +73,9 @@ class Allocator():
         def markowitz_objective(w, lambda_):
             port_var = w.T @ Sigma @ w
             port_return = w.T @ mu
+            excess_ret = max(port_return - self.risk_free_rate, 1e-4)
             return port_var - lambda_ * (port_return - self.risk_free_rate)
+
 
         best_portfolio = self.last_weights
         best_objective = np.inf
