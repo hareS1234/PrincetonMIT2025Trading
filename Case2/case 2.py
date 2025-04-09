@@ -60,6 +60,16 @@ class Allocator():
         mu = self.ema_returns
         Sigma = self.ema_cov
 
+        # Trader fix: skip update if mu too small (no signal)
+        if np.linalg.norm(mu) < 1e-4 or np.any(np.isnan(mu)) or np.any(np.isnan(Sigma)):
+            self.tick_count = 0
+            self.intraday_prices = []
+            return self.last_weights
+
+        # Ensure positive semi-definite covariance
+        Sigma = (Sigma + Sigma.T) / 2 + np.eye(self.n_assets) * 1e-6
+
+
         def markowitz_objective(w, lambda_):
             port_var = w.T @ Sigma @ w
             port_return = w.T @ mu
@@ -81,7 +91,15 @@ class Allocator():
                 best_objective = markowitz_objective(result.x, lam)
                 best_portfolio = result.x
 
+        # Defensive fallback: ensure the portfolio has correct length
         new_weights = best_portfolio
+
+        # If optimizer returned wrong shape (e.g. length 5 instead of 6), fallback
+        if new_weights.shape[0] != self.n_assets:
+            print(f"[WARNING] Weight dimension mismatch: got {new_weights.shape[0]}, expected {self.n_assets}. Using last_weights.")
+            new_weights = self.last_weights
+
+        # Enforce turnover constraint
         delta = new_weights - self.last_weights
         max_turnover = 0.05
         delta_norm = np.linalg.norm(delta, 1)
@@ -91,7 +109,9 @@ class Allocator():
         self.last_weights = np.clip(new_weights, -1, 1)
         self.tick_count = 0
         self.intraday_prices = []
+
         return self.last_weights
+
 
 # Sharpe-tuned lambda evaluator
 def evaluate_lambda(train_data, test_data, alpha, lambda_):
