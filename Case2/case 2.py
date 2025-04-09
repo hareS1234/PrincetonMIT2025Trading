@@ -1,39 +1,36 @@
 import numpy as np
 import pandas as pd
-import scipy
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-from sklearn.covariance import LedoitWolf
 from scipy.optimize import minimize
-import os
 
 # Load the data
 data = pd.read_csv('Case2.csv', index_col=0)
-
-# Split data into training and test sets
 TRAIN, TEST = train_test_split(data, test_size=0.2, shuffle=False)
 
 class Allocator():
-    def __init__(self, train_data):
-        self.running_price_paths = train_data.copy()
+    def __init__(self, train_data, alpha):
         self.train_data = train_data.copy()
         self.n_assets = train_data.shape[1]
-        self.daily_closes = train_data.iloc[29::30].reset_index(drop=True)
-        self.daily_vols = self._calculate_realized_vol(train_data)
         self.last_weights = np.ones(self.n_assets) / self.n_assets
         self.tick_count = 0
         self.intraday_prices = []
-        self.risk_free_rate = 0.0  # Set to 0.03 or other if desired
+        self.ema_returns = None
+        self.ema_var = None
+        self.alpha = alpha
+        self.risk_free_rate = 0.0
 
-    def _calculate_realized_vol(self, data):
-        vol_list = []
-        for day in range(len(data) // 30):
-            prices = data.iloc[day * 30:(day + 1) * 30]
-            log_ret = np.diff(np.log(prices), axis=0)
-            vol_list.append(np.sqrt((log_ret ** 2).sum(axis=0)))
-        return pd.DataFrame(vol_list, columns=data.columns)
+    def _detect_outliers_and_replace(self, prices):
+        if len(self.intraday_prices) < 10:
+            return prices
+        rolling_mean = pd.DataFrame(self.intraday_prices).rolling(window=10, min_periods=1).mean().iloc[-1].values
+        rolling_std = pd.DataFrame(self.intraday_prices).rolling(window=10, min_periods=1).std().iloc[-1].values + 1e-8
+        z_scores = (prices - rolling_mean) / rolling_std
+        prices[np.abs(z_scores) > 3] = rolling_mean[np.abs(z_scores) > 3]
+        return prices
 
     def allocate_portfolio(self, asset_prices):
+        asset_prices = self._detect_outliers_and_replace(np.array(asset_prices))
         self.intraday_prices.append(asset_prices)
         self.tick_count += 1
 
@@ -42,24 +39,18 @@ class Allocator():
 
         prices_matrix = np.vstack(self.intraday_prices)
         log_ret_matrix = np.diff(np.log(prices_matrix), axis=0)
-        realized_vol_today = np.sqrt(np.sum(log_ret_matrix ** 2, axis=0))
+        realized_returns = np.mean(log_ret_matrix, axis=0)
+        realized_var = np.var(log_ret_matrix, axis=0)
 
-        self.daily_closes = pd.concat(
-            [self.daily_closes, pd.DataFrame([asset_prices], columns=self.train_data.columns)],
-            ignore_index=True)
-        self.daily_vols = pd.concat(
-            [self.daily_vols, pd.DataFrame([realized_vol_today], columns=self.train_data.columns)],
-            ignore_index=True)
+        if self.ema_returns is None:
+            self.ema_returns = realized_returns
+            self.ema_var = realized_var
+        else:
+            self.ema_returns = self.alpha * self.ema_returns + (1 - self.alpha) * realized_returns
+            self.ema_var = self.alpha * self.ema_var + (1 - self.alpha) * realized_var
 
-        returns = self.daily_closes.pct_change().dropna()
-        if len(returns) < 30:
-            self.tick_count = 0
-            self.intraday_prices = []
-            return self.last_weights
-
-        mu = returns.mean().values
-        lw = LedoitWolf()
-        Sigma = lw.fit(returns).covariance_
+        mu = self.ema_returns
+        Sigma = np.diag(self.ema_var)
 
         def objective(w):
             port_return = np.dot(w, mu)
@@ -68,7 +59,7 @@ class Allocator():
 
         constraints = [
             {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
-            {'type': 'ineq', 'fun': lambda w: 0.15 / np.sqrt(252) - np.sqrt(w @ Sigma @ w.T)}
+            {'type': 'eq', 'fun': lambda w: np.sqrt(w @ Sigma @ w.T) - np.sqrt(np.mean(self.ema_var))}
         ]
 
         result = minimize(objective,
@@ -90,13 +81,11 @@ class Allocator():
         self.intraday_prices = []
         return self.last_weights
 
-def grading(train_data, test_data):
-    weights = np.full(shape=(len(test_data.index), 6), fill_value=0.0)
-    alloc = Allocator(train_data)
-    for i in range(0, len(test_data)):
+def grading(train_data, test_data, alpha):
+    weights = np.full(shape=(len(test_data.index), train_data.shape[1]), fill_value=0.0)
+    alloc = Allocator(train_data, alpha)
+    for i in range(len(test_data)):
         weights[i, :] = alloc.allocate_portfolio(test_data.iloc[i, :])
-        if np.any(weights[i, :] < -1) or np.any(weights[i, :] > 1):
-            raise Exception("Weights Outside of Bounds")
 
     capital = [1]
     for i in range(len(test_data) - 1):
@@ -107,24 +96,22 @@ def grading(train_data, test_data):
 
     capital = np.array(capital)
     returns = (capital[1:] - capital[:-1]) / capital[:-1]
-
     sharpe = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
-    return sharpe, capital, weights
+    return sharpe, capital
 
-# Run grading
-sharpe, capital, weights = grading(TRAIN, TEST)
-print(f"Sharpe Ratio: {sharpe:.4f}")
+# Run simulation
+alpha_range = np.arange(0.1, 1.0, 0.01)
+sharpe_values = []
 
-# Plotting
-plt.figure(figsize=(10, 6), dpi=80)
-plt.title("Capital Over Time")
-plt.plot(np.arange(len(TEST)), capital)
-plt.xlabel("Time")
-plt.ylabel("Capital")
+for alpha in alpha_range:
+    sharpe, _ = grading(TRAIN, TEST, alpha)
+    sharpe_values.append(sharpe)
+
+# Plotting alpha vs Sharpe
+plt.figure(figsize=(10, 6))
+plt.plot(alpha_range, sharpe_values, marker='o')
+plt.title("Sharpe Ratio vs. Alpha")
+plt.xlabel("Alpha (EMA Smoothing Factor)")
+plt.ylabel("Sharpe Ratio")
 plt.grid(True)
 plt.show()
-
-
-# credits:
-# https://github.com/sabvan/UChicagoTradingComp/blob/main/case2
-# https://github.com/PaiViji/PythonFinance-PortfolioOptimization/blob/master/Lesson6_SharpeRatioOptimization/Lesson6_MainContent.ipynb
